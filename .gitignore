@@ -1,0 +1,29 @@
+# Secrets & local data — never commit
+.env
+.env.*
+!.env.example
+backend/data/
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+*.local
+
+# Logs & editors
+*.log
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

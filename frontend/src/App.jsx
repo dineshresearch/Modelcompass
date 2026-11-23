@@ -372,7 +372,7 @@ export default function App() {
                 <h2>Connection</h2>
                 <div className="kv"><span>Endpoint</span><code>{health?.base_url || '—'}</code></div>
                 <div className="kv"><span>API key</span><code>{health?.live_configured ? 'configured (backend/.env)' : 'NOT configured'}</code></div>
-                <div className="kv"><span>Request timeout</span><code>60s per model</code></div>
+                <div className="kv"><span>Request timeout</span><code>{health?.request_timeout_s ?? 120}s per model</code></div>
                 <div className="conn-row">
                   <button className="btn-primary" onClick={testConnection} disabled={connState === 'testing'}>
                     {connState === 'testing' ? 'Testing…' : 'Test connection'}
@@ -395,7 +395,7 @@ export default function App() {
                     </label>
                     <label>Default max tokens
                       <select value={settings.max_tokens} onChange={(e) => updateSettings({ max_tokens: +e.target.value })}>
-                        {[256, 512, 1024, 2048].map((v) => <option key={v} value={v}>{v}</option>)}
+                        {[512, 1024, 2048, 4096, 8192].map((v) => <option key={v} value={v}>{v}</option>)}
                       </select>
                     </label>
                     <label className="check-line">

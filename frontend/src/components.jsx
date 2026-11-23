@@ -317,6 +317,7 @@ export function FullCard({ run, meta, index }) {
           <span>{fmtMs(run.latency_ms)}</span>
           <span>{run.input_tokens} / {run.output_tokens} tok{run.tokens_estimated ? '*' : ''}</span>
           <span>{fmtUsd(run.est_cost_usd)}</span>
+          {run.retried && <span className="retried-note" title="The model spent its first token budget on reasoning; the run was automatically retried with a doubled budget.">auto-retried (2× budget)</span>}
         </div>
       )}
       <div className="card-body">

@@ -49,6 +49,7 @@ def health() -> dict:
         "live_configured": bool(config.INFERENCE_API_KEY),
         "base_url": config.INFERENCE_BASE_URL,
         "n_models": len(MODELS),
+        "request_timeout_s": config.REQUEST_TIMEOUT_S,
     }
 
 

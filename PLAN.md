@@ -19,7 +19,7 @@ Full user journey: prompt → parallel inference → side-by-side answers → me
 - [x] `providers.py`: live OpenAI-compatible call (httpx `trust_env=False`, per-model timeout, empty-content guard for reasoning models)
 - [x] `orchestrator.py`: `asyncio.as_completed` over 2–4 models, semaphore(4), errors isolated per model
 - [x] `POST /api/compare` (SSE): `run` per model → `synthesis` → `recommendation` → `done`
-- [x] Cost controls: max_tokens default 2048 / cap 2048 (judge 4096), prompt cap 8000 chars, 60s timeout
+- [x] Cost controls: max_tokens default 4096 / cap 8192 (judge 8192), prompt cap 8000 chars, 120s timeout; auto-retry once with doubled budget when a reasoning model returns empty content
 
 ## Phase 2 — Comparison & evaluation engine
 
@@ -58,7 +58,7 @@ Full user journey: prompt → parallel inference → side-by-side answers → me
 |-----|------|------------|
 | High | Model entitlements differ per tier (OpenAI/Anthropic 403) | Catalog limited to verified-200 models; test-connection probe; tier findings documented |
 | High | Synthesis merges answers / hallucinates agreement | JSON-only judge contract, preserve originals, explicit uncertainty + confidence; heuristic fallback |
-| Med | Reasoning models return empty content at small budgets | 2048 default / 8192 judge; empty-content guard with hint |
+| Med | Reasoning models return empty content at small budgets | 4096 default / 8192 cap / 8192 judge; auto-retry ×2 budget; empty-content guard with hint |
 | Med | Reasoning judge truncates its JSON → no quality scores | Scores-first schema + compact rules + JSON repair + one retry; labeled fallback with UI warning |
 | Med | Token usage absent from API response | Heuristic estimate flagged `tokens_estimated=true`; cost labeled estimate |
 | Med | Pricing unknown | Illustrative table, clearly labeled, swap for Model Catalog rates |

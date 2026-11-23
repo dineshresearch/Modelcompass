@@ -116,6 +116,25 @@ def _try_parse(text: str) -> tuple[dict | None, str | None]:
     return None, err
 
 
+def _canonical_scores(raw: dict, ok_runs: list[dict]) -> dict:
+    """Re-key judge scores to model ids. The judge echoes labels in varying
+    formats ('Label', 'Label (id)'); matching by id/label substring keeps
+    recommendation, UI and quality history lookups deterministic."""
+    out = {}
+    for r in ok_runs:
+        mid = r["model"]
+        label = MODEL_BY_ID.get(mid, {}).get("label", mid)
+        hit = raw.get(mid) or raw.get(label)
+        if hit is None:
+            for k, v in raw.items():
+                if mid in str(k) or str(k) in label or label in str(k):
+                    hit = v
+                    break
+        if isinstance(hit, dict):
+            out[mid] = hit
+    return out
+
+
 async def synthesize_live(prompt: str, ok_runs: list[dict], judge_model: str) -> tuple[dict, dict]:
     """LLM-as-judge via one catalog model. Returns (synthesis, judge_metrics).
 
@@ -142,6 +161,7 @@ async def synthesize_live(prompt: str, ok_runs: list[dict], judge_model: str) ->
 
     latency_ms = round((time.perf_counter() - t0) * 1000, 1)
     if synthesis is not None:
+        synthesis["scores"] = _canonical_scores(synthesis.get("scores") or {}, ok_runs)
         synthesis["judge_model"] = judge_model
         synthesis["generated"] = True
         synthesis["fallback"] = False

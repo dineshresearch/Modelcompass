@@ -16,8 +16,12 @@ def _quality_map(ok_runs: list[dict], synthesis: dict | None) -> dict:
     scores = (synthesis or {}).get("scores") or {}
     out = {}
     for r in ok_runs:
-        s = scores.get(_label(r["model"])) or scores.get(r["model"])
-        out[r["model"]] = s.get("quality") if isinstance(s, dict) else None
+        mid = r["model"]
+        label = _label(mid)
+        s = scores.get(mid) or scores.get(label)
+        if s is None:
+            s = next((v for k, v in scores.items() if mid in str(k) or label in str(k)), None)
+        out[mid] = s.get("quality") if isinstance(s, dict) else None
     return out
 
 
@@ -26,7 +30,9 @@ def recommend(runs: list[dict], synthesis: dict | None, settings: dict) -> dict 
     if not ok:
         return None
     quality = _quality_map(ok, synthesis)
-    lat = {r["model"]: max(0.001, r["latency_ms"] / 1000) for r in ok}
+    # Cache hits report ~0ms lookup latency; rank them by the original generation
+    # latency so a cached answer doesn't unfairly win the latency term.
+    lat = {r["model"]: max(0.001, (r.get("original_latency_ms") or r["latency_ms"]) / 1000) for r in ok}
     cost = {r["model"]: r["est_cost_usd"] for r in ok}
     min_lat, min_cost = min(lat.values()), min(cost.values())
 
@@ -74,7 +80,7 @@ def recommend(runs: list[dict], synthesis: dict | None, settings: dict) -> dict 
         if synthesis is None:
             reasons.append({"ok": False, "text": "Quality not judged (synthesis disabled) — ranking uses latency and cost only."})
         else:
-            reasons.append({"ok": False, "text": "Judge scores unavailable (judge output failed to parse) — ranking uses latency and cost only. Re-run to retry the judge."})
+            reasons.append({"ok": False, "text": "Judge quality scores unavailable for this run — ranking uses latency and cost only. Re-run to retry the judge."})
 
     return {
         "strategy": strategy,

@@ -49,6 +49,18 @@ MODELS = [
 
 MODEL_BY_ID = {m["id"]: m for m in MODELS}
 
+# Verified live (2026-11-22): payload knobs that suppress reasoning tokens.
+# "full" = reasoning_tokens drops to ~0; "partial" = upstream only reduces reasoning
+# (MiniMax M2.5 has no full off switch on this endpoint) — labeled honestly in the UI.
+REASONING_OFF = {
+    "deepseek-v4.1-flash": {"payload": {"reasoning_effort": "none"}, "effect": "full"},
+    "glm-5.3-flash": {"payload": {"reasoning_effort": "none"}, "effect": "full"},
+    "minimax-m2.5": {"payload": {"thinking": {"type": "disabled"}}, "effect": "partial"},
+    "kimi-k2.6": {"payload": {"reasoning_effort": "none"}, "effect": "full"},
+}
+for _m in MODELS:
+    _m["reasoning_off_effect"] = REASONING_OFF[_m["id"]]["effect"]
+
 PRICING_NOTE = (
     "Illustrative placeholder pricing ($/million tokens). "
     "Replace with DigitalOcean Model Catalog rates before any real cost analysis."

@@ -1,34 +1,42 @@
-"""Model Compass — FastAPI orchestration service (live-only PoC)."""
+"""Model Compass — FastAPI orchestration service (live-only PoC).
+
+Endpoints map to the design doc: streaming compare (SSE) with an async job
+fallback, pre-run estimates, budget-aware panel suggestions, spend guardrails,
+an explicit failure contract (overall_status envelope, retry-failed panels),
+and the experiment/preference/export history.
+"""
 import asyncio
 import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import config, store
+from . import config, jobs, store
 from .catalog import MODELS, MODEL_BY_ID, PRICING_NOTE
+from .costguard import SpendCapError, check_spend_caps, estimate_run, suggest_panel
 from .export import render_json, render_markdown
-from .orchestrator import make_tasks
+from .orchestrator import BudgetGuard, _envelope, run_experiment, stream_panels
 from .providers import live_call
 from .recommend import recommend
-from .schemas import CompareRequest, PreferenceRequest, SettingsUpdate
+from .schemas import CompareRequest, EstimateRequest, PreferenceRequest, SettingsUpdate, SuggestPanelRequest
 from .synthesis import heuristic_synthesis, synthesize_live
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("compass")
 
-app = FastAPI(title="Model Compass PoC", version="0.2.0")
+app = FastAPI(title="Model Compass PoC", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+TERMINAL = ("panel_completed", "panel_error", "panel_skipped")
 
 
 @app.on_event("startup")
@@ -89,9 +97,39 @@ async def test_connection() -> dict:
         return {"ok": False, "message": f"{type(e).__name__}: {e}"}
 
 
+@app.post("/api/estimate")
+def estimate(req: EstimateRequest) -> dict:
+    """Pre-run worst-case cost preview (models x token caps + judge), before anything is invoked."""
+    unknown = [m for m in req.models if m not in MODEL_BY_ID]
+    if unknown:
+        raise HTTPException(400, f"Unknown models: {unknown}")
+    settings = store.get_settings()
+    judge = req.judge_model or settings["judge_model"]
+    if judge not in MODEL_BY_ID:
+        raise HTTPException(400, "judge_model must be one of the catalog models")
+    est = estimate_run(req.models, req.prompt, req.max_tokens, req.synthesize, judge)
+    est["spend"] = store.spend_summary()
+    return est
+
+
+@app.post("/api/suggest-panel")
+def suggest(req: SuggestPanelRequest) -> dict:
+    """Budget-aware panel selection: cheapest subset clearing the quality floor."""
+    settings = store.get_settings()
+    floor = req.quality_floor if req.quality_floor is not None else int(settings["quality_threshold"])
+    return suggest_panel(req.budget_usd, req.max_tokens, req.synthesize, settings["judge_model"], floor)
+
+
+@app.get("/api/spend")
+def spend() -> dict:
+    return store.spend_summary()
+
+
 @app.post("/api/compare")
 async def compare(req: CompareRequest):
-    """Parallel comparison, streamed as SSE: run events → synthesis → recommendation → done."""
+    """Parallel comparison. SSE by default (started -> panel_* -> synthesis ->
+    recommendation -> done envelope); async job_id + polling for Deep mode or
+    when the client asks for the streaming fallback."""
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(400, "Prompt is empty")
@@ -104,73 +142,97 @@ async def compare(req: CompareRequest):
         raise HTTPException(400, f"Unknown models: {unknown}")
     if len(set(req.models)) != len(req.models):
         raise HTTPException(400, "Duplicate models selected")
+    bad_overrides = [m for m in req.reasoning_overrides if m not in req.models]
+    if bad_overrides:
+        raise HTTPException(400, f"reasoning_overrides for unselected models: {bad_overrides}")
     if not config.INFERENCE_API_KEY:
         raise HTTPException(400, "No INFERENCE_API_KEY configured in backend/.env")
     settings = store.get_settings()
     max_tokens = min(req.max_tokens, config.MAX_TOKENS_CAP)
 
-    async def event_stream():
-        exp_id = uuid.uuid4().hex[:12]
-        started = time.perf_counter()
-        log.info("experiment=%s models=%s", exp_id, req.models)
+    est = estimate_run(req.models, prompt, max_tokens, req.synthesize, settings["judge_model"])
+    try:
+        check_spend_caps(est["total_usd"])
+    except SpendCapError as e:
+        raise HTTPException(400, str(e))
+
+    params = {
+        "prompt": prompt,
+        "models": req.models,
+        "max_tokens": max_tokens,
+        "synthesize": req.synthesize,
+        "run_mode": req.mode,
+        "budget_usd": req.budget_usd,
+        "reasoning_map": {m: req.reasoning_overrides.get(m, req.reasoning) for m in req.models},
+        "refresh": req.refresh,
+    }
+    exp_id = uuid.uuid4().hex[:12]
+    log.info("experiment=%s mode=%s models=%s budget=%s", exp_id, req.mode, req.models, req.budget_usd)
+
+    if req.async_mode or req.mode == "deep":
+        job_id = jobs.start_job(params, settings, exp_id)
+        return JSONResponse(status_code=202, content={"job_id": job_id, "experiment_id": exp_id, "poll": f"/api/jobs/{job_id}"})
+
+    cancel = asyncio.Event()
+    registry: dict = {}
+    jobs.register_active(exp_id, cancel, registry)
+
+    # The run is decoupled from the SSE connection: if the client disconnects
+    # (abort/closed tab), we signal graceful cancellation and the pump still
+    # winds down, labels partial results and persists the experiment.
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump():
         try:
-            tasks = make_tasks(req.models, prompt, max_tokens)
-            runs: list[dict] = []
-            for fut in asyncio.as_completed(tasks):
-                run = await fut
-                runs.append(run)
-                log.info("experiment=%s model=%s status=%s latency_ms=%s", exp_id, run["model"], run["status"], run["latency_ms"])
-                yield _sse({"type": "run", "run": run})
-            runs.sort(key=lambda r: req.models.index(r["model"]))
-
-            synthesis, judge_metrics = None, None
-            ok_runs = [r for r in runs if r["status"] == "ok"]
-            if req.synthesize and len(ok_runs) >= 2:
-                try:
-                    synthesis, judge_metrics = await synthesize_live(prompt, ok_runs, settings["judge_model"])
-                except Exception as e:  # noqa: BLE001 — synthesis failure must not lose the runs
-                    log.warning("experiment=%s synthesis failed: %s", exp_id, e)
-                    synthesis = heuristic_synthesis(ok_runs, note=f"Synthesis judge failed ({type(e).__name__}); showing heuristic comparison.")
-                    judge_metrics = None
-                yield _sse({"type": "synthesis", "synthesis": synthesis, "judge_metrics": judge_metrics})
-
-            rec = recommend(runs, synthesis, settings)
-            if rec:
-                yield _sse({"type": "recommendation", "recommendation": rec})
-
-            total_cost = sum(r["est_cost_usd"] for r in runs) + (judge_metrics or {}).get("est_cost_usd", 0.0)
-            exp = {
-                "id": exp_id,
-                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "mode": config.MODE,
-                "prompt": prompt,
-                "max_tokens": max_tokens,
-                "synthesis": synthesis,
-                "judge_metrics": judge_metrics,
-                "recommendation": rec,
-                "total_cost_usd": round(total_cost, 6),
-                "total_latency_ms": round((time.perf_counter() - started) * 1000, 1),
-            }
-            await asyncio.to_thread(store.save_experiment, exp, runs)
-            yield _sse({
-                "type": "done",
-                "experiment_id": exp_id,
-                "totals": {
-                    "cost_usd": round(total_cost, 6),
-                    "wall_latency_ms": exp["total_latency_ms"],
-                    "models_ok": len(ok_runs),
-                    "models_failed": len(runs) - len(ok_runs),
-                },
-            })
+            async for ev in run_experiment(params, settings, exp_id, cancel, registry):
+                await queue.put(ev)
         except Exception as e:  # noqa: BLE001
             log.exception("experiment=%s stream error", exp_id)
-            yield _sse({"type": "error", "message": f"{type(e).__name__}: {e}"})
+            await queue.put({"type": "error", "message": f"{type(e).__name__}: {e}"})
+        finally:
+            await queue.put(None)
+            jobs.unregister_active(exp_id)
+
+    asyncio.create_task(pump())
+
+    async def event_stream():
+        try:
+            while True:
+                ev = await queue.get()
+                if ev is None:
+                    break
+                yield _sse(ev)
+        finally:
+            cancel.set()
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/compare/{exp_id}/cancel")
+def cancel_compare(exp_id: str) -> dict:
+    """Cancel streaming: stop launching/abort panels, preserve labeled partial results."""
+    if not jobs.cancel_experiment(exp_id):
+        raise HTTPException(404, "No active run for this experiment id")
+    return {"ok": True, "experiment_id": exp_id}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str) -> dict:
+    snap = jobs.snapshot(job_id)
+    if not snap:
+        raise HTTPException(404, "Job not found")
+    return snap
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict:
+    if not jobs.cancel_job(job_id):
+        raise HTTPException(404, "No running job with this id")
+    return {"ok": True, "job_id": job_id}
 
 
 @app.get("/api/experiments")
@@ -211,6 +273,65 @@ def recompute_recommendation(exp_id: str) -> dict:
     return {"recommendation": rec}
 
 
+@app.post("/api/experiments/{exp_id}/retry-failed")
+async def retry_failed(exp_id: str) -> dict:
+    """Re-run failed/skipped/cancelled panels in place (cache bypassed), refresh
+    the judge when the quorum is (newly) met, and recompute the envelope."""
+    exp = store.get_experiment(exp_id)
+    if not exp:
+        raise HTTPException(404, "Experiment not found")
+    failed = [r for r in exp["runs"] if r["status"] in ("error", "skipped", "cancelled")]
+    if not failed:
+        raise HTTPException(400, "No failed panels to retry")
+    settings = store.get_settings()
+    prompt = exp["prompt"]
+    max_tokens = exp.get("max_tokens") or config.MAX_TOKENS_DEFAULT
+    est = estimate_run([r["model"] for r in failed], prompt, max_tokens,
+                       bool(exp.get("synthesize")), settings["judge_model"])
+    try:
+        check_spend_caps(est["total_usd"])
+    except SpendCapError as e:
+        raise HTTPException(400, str(e))
+    reasoning_map = {r["model"]: bool(r.get("reasoning", True)) for r in failed}
+    cancel = asyncio.Event()
+    registry: dict = {}
+    jobs.register_active(exp_id, cancel, registry)
+    new_runs: dict[str, dict] = {}
+    try:
+        async for ev in stream_panels([r["model"] for r in failed], prompt, max_tokens, reasoning_map,
+                                      BudgetGuard(None), cancel, True, registry):
+            if ev["type"] in TERMINAL:
+                new_runs[ev["run"]["model"]] = ev["run"]
+    finally:
+        jobs.unregister_active(exp_id)
+
+    merged = [new_runs.get(r["model"], r) for r in exp["runs"]]
+    ok_runs = [r for r in merged if r["status"] == "ok"]
+    syn_requested = bool(exp.get("synthesize"))
+    synthesis, judge_metrics = exp.get("synthesis"), exp.get("judge_metrics")
+    needs_judge = syn_requested and len(ok_runs) >= 2 and (
+        synthesis is None or synthesis.get("fallback") or any(r["model"] in new_runs and r["status"] == "ok" for r in merged)
+    )
+    if needs_judge:
+        try:
+            synthesis, judge_metrics = await synthesize_live(prompt, ok_runs, settings["judge_model"])
+        except Exception as e:  # noqa: BLE001
+            synthesis = heuristic_synthesis(ok_runs, note=f"Synthesis judge failed ({type(e).__name__}); showing heuristic comparison.")
+            judge_metrics = None
+    rec = recommend(merged, synthesis, settings)
+    overall = _envelope(merged, synthesis, syn_requested, False)
+    notes = [f"{r['model']}: {r['error_kind'] or r['status']} — {r['error']}" for r in merged if r["status"] != "ok"]
+    if synthesis and synthesis.get("fallback"):
+        notes.append("Judge failed; heuristic fallback shown (no quality scores). Result marked degraded.")
+    total_cost = sum(r["est_cost_usd"] for r in merged) + (judge_metrics or {}).get("est_cost_usd", 0.0)
+    store.replace_runs(exp_id, merged, {
+        "synthesis": synthesis, "judge_metrics": judge_metrics, "recommendation": rec,
+        "overall_status": overall, "status_notes": notes, "total_cost_usd": round(total_cost, 6),
+    })
+    log.info("experiment=%s retry-failed retried=%s overall=%s", exp_id, list(new_runs), overall)
+    return store.get_experiment(exp_id)
+
+
 @app.get("/api/experiments/{exp_id}/export")
 def export(exp_id: str, format: str = "json"):
     exp = store.get_experiment(exp_id)
@@ -231,4 +352,4 @@ def export(exp_id: str, format: str = "json"):
 
 @app.get("/api/stats")
 def stats() -> dict:
-    return store.stats()
+    return {**store.stats(), "quality_history": store.model_quality()}

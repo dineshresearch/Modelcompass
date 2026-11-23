@@ -18,9 +18,15 @@ def render_markdown(exp: dict) -> str:
         "",
         f"- **Experiment:** `{exp['id']}`",
         f"- **Date:** {exp['created_at']}",
-        f"- **Mode:** {exp['mode']}",
+        f"- **Mode:** {exp['mode']} · run mode: {exp.get('run_mode') or 'custom'}",
+        f"- **Overall status:** {exp.get('overall_status') or 'ok'}"
+        + (f" · budget cap ${exp['budget_usd']:.4f}" if exp.get("budget_usd") else ""),
         f"- **Total estimated cost:** ${exp.get('total_cost_usd', 0):.6f} (illustrative pricing)",
         "",
+    ]
+    if exp.get("status_notes"):
+        lines += ["## Status notes", ""] + [f"- {n}" for n in exp["status_notes"]] + [""]
+    lines += [
         "## Prompt",
         "",
         exp["prompt"],
@@ -31,13 +37,25 @@ def render_markdown(exp: dict) -> str:
         lines += ["", f"### {_label(r['model'])} — {r['status']}", ""]
         if r["status"] == "ok":
             est = " (estimated)" if r.get("tokens_estimated") else ""
+            badges = []
+            if r.get("cache_hit"):
+                badges.append(f"cache hit: {r['cache_hit']}" + (f" (similarity {r['cache_similarity']})" if r.get("cache_similarity") else "") + f", generated {r.get('cached_at', '?')}")
+            if r.get("retried"):
+                badges.append("auto-retried")
+            if not r.get("reasoning", True):
+                badges.append("reasoning off")
+            if r.get("upstream_cached_tokens"):
+                badges.append(f"upstream prefix cache: {r['upstream_cached_tokens']} tokens")
             lines += [
                 f"*Latency {r['latency_ms']:.0f} ms · {r['input_tokens']} in / {r['output_tokens']} out tokens{est} · est. ${r['est_cost_usd']:.6f}*",
-                "",
-                r["output"] or "",
             ]
+            if badges:
+                lines += ["", "*" + " · ".join(badges) + "*"]
+            lines += ["", r["output"] or ""]
         else:
-            lines += [f"**Error:** {r['error']}"]
+            lines += [f"**Error ({r.get('error_kind') or r['status']}):** {r['error']}"]
+            if r.get("output_tokens"):
+                lines += ["", f"*Burned upstream tokens: {r.get('input_tokens', 0)} in / {r['output_tokens']} out (est. ${r.get('est_cost_usd', 0):.6f}); auto-retried: {bool(r.get('retried'))}.*"]
     syn = exp.get("synthesis")
     if syn:
         lines += ["", "## Synthesis", "",

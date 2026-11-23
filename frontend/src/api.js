@@ -33,13 +33,20 @@ export async function putJSON(url, body) {
   return r.json()
 }
 
-/** POST /api/compare and consume SSE events: run | synthesis | recommendation | done | error */
-export async function streamCompare(payload, onEvent) {
+/**
+ * POST /api/compare. SSE by default; Deep mode (or async_mode) returns 202 with
+ * a job_id to poll. Events: started | panel_started | panel_token | panel_retry |
+ * panel_completed | panel_error | panel_skipped | synthesis | recommendation |
+ * done | error.
+ */
+export async function compareStream(payload, onEvent, signal) {
   const resp = await fetch('/api/compare', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal,
   })
+  if (resp.status === 202) return { job: await resp.json() }
   if (!resp.ok) {
     const e = await resp.json().catch(() => ({}))
     throw new Error(e.detail || `HTTP ${resp.status}`)
@@ -60,7 +67,28 @@ export async function streamCompare(payload, onEvent) {
       }
     }
   }
+  return { streamed: true }
 }
+
+/** Poll an async job until it reaches a terminal state; onSnapshot per tick. */
+export async function pollJob(jobId, onSnapshot, signal, intervalMs = 500) {
+  for (;;) {
+    const snap = await getJSON(`/api/jobs/${jobId}`)
+    onSnapshot(snap)
+    if (['completed', 'failed', 'cancelled'].includes(snap.status)) return snap
+    await new Promise((res, rej) => {
+      const t = setTimeout(res, intervalMs)
+      signal?.addEventListener('abort', () => { clearTimeout(t); rej(new DOMException('Aborted', 'AbortError')) }, { once: true })
+    })
+  }
+}
+
+export const cancelRun = (expId) => postJSON(`/api/compare/${expId}/cancel`, {})
+export const cancelJob = (jobId) => postJSON(`/api/jobs/${jobId}/cancel`, {})
+export const retryFailed = (expId) => postJSON(`/api/experiments/${expId}/retry-failed`, {})
+export const getEstimate = (payload) => postJSON('/api/estimate', payload)
+export const suggestPanel = (payload) => postJSON('/api/suggest-panel', payload)
+export const getSpend = () => getJSON('/api/spend')
 
 export function downloadExport(expId, format) {
   const a = document.createElement('a')
@@ -83,3 +111,10 @@ export const fmtMs = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${Ma
 export const fmtSec = (ms) => `${(ms / 1000).toFixed(1)}s`
 export const fmtUsd = (v) => `$${(v || 0).toFixed(v && v < 0.01 ? 4 : 3)}`
 export const letter = (i) => String.fromCharCode(65 + i)
+
+/** Judge score keys vary ('id', 'Label', 'Label (id)'); match tolerantly. */
+export const scoreFor = (scores, model, label) => {
+  if (!scores) return undefined
+  return scores[model] || scores[label]
+    || Object.entries(scores).find(([k]) => k.includes(model) || (label && k.includes(label)))?.[1]
+}

@@ -3,18 +3,20 @@
 A multi-model comparison playground — PoC for the DigitalOcean staff ML take-home.
 It demonstrates the **complete user journey**, not just an API that calls several models:
 
-> prompt → parallel inference → side-by-side answers → performance metrics → judge synthesis (with explicit uncertainty) → routing recommendation → user preference → export
+> prompt → cost estimate → parallel streaming inference → blind side-by-side answers → performance metrics → judge synthesis (with explicit uncertainty) → routing recommendation → user preference → export
 
 Built **live-only** against DigitalOcean Serverless Inference (`https://inference.do-ai.run/v1`, OpenAI-compatible). Four models verified working with the project key (HTTP 200 on `chat/completions`):
 
-| Model ID | Label | Role |
-|---|---|---|
-| `deepseek-v4.1-flash` | DeepSeek V4.1 Flash | fast reasoning |
-| `glm-5.3-flash` | GLM 5.3 Flash | low-latency; default synthesis judge |
-| `minimax-m2.5` | MiniMax M2.5 | general-purpose reasoning |
-| `kimi-k2.6` | Kimi K2.6 | long-context chat |
+| Model ID | Label | Role | Reasoning off |
+|---|---|---|---|
+| `deepseek-v4.1-flash` | DeepSeek V4.1 Flash | fast reasoning | full (`reasoning_effort: none`) |
+| `glm-5.3-flash` | GLM 5.3 Flash | low-latency; default synthesis judge | near-full (`reasoning_effort: none`) |
+| `minimax-m2.5` | MiniMax M2.5 | general-purpose reasoning | **partial only** (`thinking: disabled`, ~50% reduction) |
+| `kimi-k2.6` | Kimi K2.6 | long-context chat | full (`reasoning_effort: none`) |
 
-**Key/tier findings (verified server-side):** the API key authenticates (`GET /v1/models` → 200, 78 models). OpenAI/Anthropic catalog entries (e.g. `openai-gpt-5-nano`, `openai-gpt-6-sol`, `openai-gpt-6-luna`) return **403 "not available for your subscription tier"** on this key's plan, so the catalog uses the four working models above.
+The reasoning-off knobs were probed live per model; the UI labels MiniMax honestly as a partial reduction rather than claiming a full off switch.
+
+**Key/tier findings (verified server-side):** the API key authenticates (`GET /v1/models` → 200, 78 models). OpenAI/Anthropic catalog entries return **403 "not available for your subscription tier"** on this key's plan, so the catalog uses the four working models above.
 
 ## Quickstart (live — API key required)
 
@@ -33,30 +35,41 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173 — the sample prompt is prefilled and all four models are selected; click **Compare Models**.
+Open http://localhost:5173 — Fast mode is the default (two cheapest models, no judge, streamed). Click **Compare Models**.
 
 The API key lives only in `backend/.env` (gitignored). The frontend never sees it; Settings shows "configured (backend/.env)" and a **Test connection** probe.
 
+## Run modes
+
+| Mode | Panel | Judge | Delivery |
+|---|---|---|---|
+| **Fast** (default) | 2 cheapest models | no | SSE token streaming |
+| **Balanced** | 3–4 models | lightweight judge | SSE token streaming |
+| **Deep** | full panel | judge + synthesis | opt-in **async job** (202 + `job_id`, polling with partial output) |
+| Custom | any deviation from a preset | as configured | SSE (or async if requested) |
+
 ## The journey (six views)
 
-- **Dashboard** — prompt + model chips, light-blue "Recommended" routing card, side-by-side preview cards (quality score, latency, cost; blue-bordered **Best Fit**), grouped-bar **Model Tradeoffs** chart, "Why this recommendation?" reasons, status bar (adaptive-escalation toggle, evaluation confidence).
-- **Compare** — full, unaltered markdown outputs with isolated per-model errors; performance table (status, latency, tokens in/out, est. cost, wall clock, total incl. judge).
-- **Evaluate** — judge synthesis as a separate labeled artifact (agreements / attributed differences / weaknesses with confidence / uncertainty notes), judge quality scores with rationales, and **your preference** (pick + reason, persisted) with JSON/Markdown export.
+- **Dashboard** — prompt, run-mode selector, model chips with per-model **R** (reasoning) toggles, global reasoning switch with a trade-off note, **$ cap** input, **Fresh run** (cache bypass), pre-run **worst-case estimate**, **Run cheaper** and **Suggest panel** actions; live streaming previews with cursor; blind Model A–D cards with a **Reveal model names** button; status banner carrying the run envelope (ok / partial / degraded / failed / cancelled) and expandable status notes; tradeoffs chart; "Why this recommendation?" reasons; adaptive-escalation toggle.
+- **Compare** — full, unaltered markdown outputs; isolated per-model failure boxes with error kinds (timeout / rate_limited / failed / circuit_open / budget / cancelled); **Retry failed panels** re-runs only the bad panels in place and re-judges when the quorum is met; performance table with cache badges, burned-token costs on failed panels, and totals incl. judge and budget spend.
+- **Evaluate** — judge synthesis as a separate labeled artifact (agreements / attributed differences / weaknesses with confidence / uncertainty notes), judge quality scores with rationales, and **your preference** (pick + reason, persisted). Blind mode masks model names even inside the judge's prose until you reveal. JSON/Markdown export.
 - **Recommend** — composite scoring per model, routing policy controls (latency SLO, quality threshold, adaptive escalation). Changes recompute the current experiment and apply to future runs.
-- **History** — every experiment with best fit, strategy, preference, cost; open / export JSON / export MD.
-- **Settings** — endpoint, key status, timeout, judge model, default max tokens, synthesis toggle.
+- **History** — every experiment with run mode, envelope status, best fit, strategy, preference, cost; open / export JSON / export MD.
+- **Settings** — endpoint, key status, timeout, judge model, default max tokens, synthesis toggle; **answer cache** (enabled + freshness TTL); **spend guardrails** (daily/monthly caps with usage bars and ok/warn/blocked alerts).
 
 ## Architecture
 
 ```
 React (Vite) frontend ── /api proxy ──▶ FastAPI orchestration service
-  6 views · SSE consumer                   auth boundary (key server-side)
-  preview/full cards · metrics             bounded concurrency (4) · per-model timeouts
-  synthesis · preference · export          cost controls (token/prompt caps)
-        │                                        │
-        │ SSE: run → synthesis →                 ├──▶ inference.do-ai.run (×N parallel)
-        │      recommendation → done             ├──▶ judge (1 extra call) + recommendation engine
-        └────────────────────────────────────────┴──▶ SQLite: experiments · runs · settings
+  6 views · SSE consumer + job poller      auth boundary (key server-side)
+  blind reveal · budget UX · badges        bounded concurrency (4) · per-model timeouts
+        │                                  circuit breakers · jittered transient retry
+        │ SSE: started → panel_started →   cost guard (estimate · reservations · caps)
+        │ panel_token → panel_* →          cache (exact + semantic + single-flight)
+        │ synthesis → recommendation →     failure envelope · retry-failed · cancel
+        │ done (envelope + totals)         ├──▶ inference.do-ai.run (×N parallel, streamed)
+        │                                  ├──▶ judge (1 extra call, gated by quorum)
+        └── 202 job_id (Deep) ────────────▶┴──▶ SQLite: experiments · runs · cache · settings
 ```
 
 Mapping to DigitalOcean's existing surface (build on, don't duplicate):
@@ -65,7 +78,7 @@ Mapping to DigitalOcean's existing surface (build on, don't duplicate):
 |---|---|
 | `catalog.py` model list + pricing | Model Catalog |
 | Playground-style comparison UI | Model Playground |
-| `providers.py` OpenAI-compatible calls | Serverless Inference |
+| `providers.py` OpenAI-compatible streaming calls | Serverless Inference |
 | Synthesis judge + preference capture | Evaluations (preference data flywheel) |
 | Recommendation engine / adaptive escalation | Inference Router |
 
@@ -73,43 +86,42 @@ Mapping to DigitalOcean's existing surface (build on, don't duplicate):
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/health` · `GET /api/models` | Key status, catalog, pricing note |
-| `GET /api/settings` · `PUT /api/settings` | Run defaults + routing policy |
-| `POST /api/compare` | SSE: `run` per model (as completed) → `synthesis` → `recommendation` → `done` |
+| `GET /api/health` · `GET /api/models` | Key status, catalog, pricing note, reasoning-off effects |
+| `GET /api/settings` · `PUT /api/settings` | Run defaults, routing policy, cache, spend caps |
+| `POST /api/estimate` | Pre-run worst-case cost (panels + judge), before anything is invoked |
+| `POST /api/suggest-panel` | Cheapest panel clearing the historical quality floor within a budget |
+| `GET /api/spend` | UTC day/month spend vs caps, alert level, remaining |
+| `POST /api/compare` | SSE: `started` → `panel_started` / `panel_token` / `panel_retry` / `panel_completed` / `panel_error` / `panel_skipped` → `synthesis` → `recommendation` → `done` (envelope + totals). Deep/async → **202** `{job_id, experiment_id}` |
+| `GET /api/jobs/{id}` · `POST /api/jobs/{id}/cancel` | Async job snapshot (partial output while running) / cancel |
+| `POST /api/compare/{id}/cancel` | Cancel a streaming run; partial results preserved and labeled |
+| `POST /api/experiments/{id}/retry-failed` | Re-run failed/skipped/cancelled panels in place, re-judge, recompute envelope |
 | `POST /api/test-connection` | Live key probe via the judge model |
 | `GET /api/experiments` · `GET /api/experiments/{id}` | History |
 | `POST /api/experiments/{id}/preference` | Preferred model + reason |
 | `POST /api/experiments/{id}/recommend` | Recompute recommendation with current settings |
-| `GET /api/experiments/{id}/export?format=json\|md` | Download |
-| `GET /api/stats` | Per-model latency/cost/error aggregates, preference wins |
+| `GET /api/experiments/{id}/export?format=json\|md` | Download (badges, notes, burned costs included) |
+| `GET /api/stats` | Per-model aggregates, preference wins, quality history |
 
-## Key design decisions
+## Key design decisions (mirrors the design doc)
 
-- **Synthesis never merges answers.** The judge produces a separate, labeled JSON artifact (agreements, attributed differences, weaknesses with confidence, uncertainty notes, per-model quality scores). Originals are stored and displayed unaltered. If the judge fails or returns invalid JSON, a deterministic heuristic fallback (lexical overlap) is shown — clearly marked as non-semantic, with an amber warning and no fabricated scores.
-- **Judge reliability.** Quality scores come from an LLM-as-judge (default `glm-5.3-flash`, configurable). Reasoning judges can truncate their JSON at the token cap, so the pipeline uses a scores-first schema, compact output rules, an 8192-token judge budget, best-effort truncated-JSON repair, and one automatic compact retry. Fallbacks are honestly labeled (`fallback: true`, `judge_model: heuristic-fallback`).
-- **Recommendation from real metrics.** Composite = `0.5·quality + 0.3·cost-efficiency + 0.2·latency-efficiency` (efficiencies = min/value across the run). **Adaptive escalation** overrides the balanced pick when its judge quality is below the threshold, routing to the highest-quality model that clears it. Reasons are explicit (SLO check, cost rank, judge score) — no fabricated numbers.
-- **Error isolation.** Each model runs as its own task with a timeout; a failure becomes an `error` run, never an exception that sinks the comparison. SSE emits each result the moment it completes. If a reasoning model spends its whole token budget thinking and returns empty content, the run **auto-retries once with a doubled budget** (up to the cap) before failing — badged "auto-retried (2× budget)" in the Compare view.
-- **Reasoning-model headroom.** These models emit `reasoning_content` before final content; small token budgets return empty answers. Defaults: 4096 max tokens per run (cap 8192), 8192 for the judge, 120s per-model timeout, and an explicit empty-content guard with a hint.
-- **Honest metrics.** Token counts come from API `usage`; when absent, a ~4 chars/token estimate is flagged `tokens_estimated` (`*` in the UI). Pricing is an **illustrative placeholder table** — swap in DO Model Catalog rates before any real cost analysis.
-- **Preference as evaluation data.** User picks + reasons are persisted per experiment — the seed of a preference dataset (human feedback drives ranking/evals, not just vibes).
-- **Cost controls.** Prompt capped at 8000 chars, 2–4 models per run, concurrency semaphore, 120s per-model timeout. The judge is one extra call, tracked separately in totals.
+- **SSE orchestration, not request/response.** Tokens stream per panel the moment they arrive (`panel_token`), with an async job fallback for Deep mode. The run is decoupled from the connection: a client disconnect triggers graceful cancellation and still persists labeled partial results.
+- **Full fan-out with error isolation.** Each model is its own task under a concurrency semaphore; a failure becomes a labeled `error` run, never an exception that sinks the comparison. Per-model **circuit breakers** (3 consecutive failures → 60s cooldown → half-open probe) and one jittered retry for transient errors (429/5xx/timeouts).
+- **Failure envelope (HTTP 200 ≠ success).** Every run ends with `overall_status` ∈ ok / partial / degraded / failed / cancelled plus human-readable `status_notes`. Synthesis is **gated by a quorum of 2** ok panels — a single-model result is never presented as multi-model synthesis. Judge failures fall back to a clearly labeled heuristic (no fabricated scores) and mark the run degraded.
+- **LLM-as-judge, separate artifact.** The judge produces labeled JSON (agreements, attributed differences, weaknesses with confidence, uncertainty, per-model quality scores). Originals are stored and displayed unaltered. Reliability: scores-first schema, 8192-token judge budget, truncated-JSON repair, one compact retry. Score keys are canonicalized to model ids so recommendation/UI/history lookups are deterministic.
+- **Blind comparison.** Answers are Model A–D until the user clicks **Reveal**; the judge's prose is masked too, so preference data stays unbiased. Revealing is a user action, never automatic.
+- **Budget-first experience.** Pre-run worst-case **estimate**; per-request **$ cap** with reservation accounting (panels that cannot fit are **skipped and labeled**, never silently dropped); **Run cheaper** (2 cheapest models, no judge, reasoning off, smaller budget) and **Suggest panel** (cheapest subset clearing the historical quality floor); **daily/monthly spend caps** that block runs before invocation and alert at 80%.
+- **Reasoning budgets.** Reasoning on/off per run and per model, with verified per-model knobs and an honest pre-run trade-off note. MiniMax only supports a partial reduction and is labeled as such.
+- **Aggressive caching, honestly labeled.** Exact (normalized prompt + model + params) and semantic (lexical Jaccard ≥ 0.85, labeled with the similarity score) tiers with a freshness TTL; hits are **$0** and badged with their age; ranking uses the original generation latency. Concurrent identical calls are deduped (single-flight). Upstream prompt-prefix caching is surfaced via `usage.cached_tokens`. **Fresh run** bypasses everything.
+- **Honest metering.** Tokens come from API `usage` (estimated ~4 chars/token only when absent, flagged `*`). Failed panels that burned upstream tokens (e.g. reasoning-only output) record those tokens and cost instead of claiming $0. Cancelled runs carry an explicit note that partial upstream costs may not be reflected. Pricing is an **illustrative placeholder table**.
+- **Recommendation from real metrics.** Composite = `0.5·quality + 0.3·cost-efficiency + 0.2·latency-efficiency`; **adaptive escalation** overrides the balanced pick below the quality threshold. Reasons are explicit — no fabricated numbers.
+- **Preference as evaluation data.** Picks + reasons persist per experiment — the seed of a preference dataset.
 
-## What is real vs illustrative
+**Verification (2026-11-23):** backend smoke suite **23/23** (streaming event order + tokens, reasoning-off honored, exact/semantic cache hits at $0, budget skips + degraded envelope, retry-failed → 4/4 ok, cancel → cancelled envelope with partials, Deep 202 → polling partial output → completed + persisted). Full browser journey verified: Fast/Balanced/Deep runs, live streaming render, blind reveal + masked synthesis, reasoning toggles, Run cheaper / Suggest panel, cache badges, budget-skip badges, spend WARN + hard block, retry-failed (success and honest failure with burned-cost metering), cancel mid-run, preference save, exports, all six views. `npm run build` passes.
 
-| Real (verified live) | Illustrative |
-|---|---|
-| Parallel inference to all 4 models (4/4 ok) | Pricing table (placeholder $/M rates) |
-| Latency, token usage, SSE streaming | — |
-| Judge synthesis + quality scores (glm-5.3-flash) | — |
-| Recommendation + adaptive escalation (tested: threshold 90 → routes to Kimi) | — |
-| Preference persistence, history, JSON/MD exports | — |
+## Production next steps (roadmap)
 
-**Verification status (2026-11-21):** full live journey verified through the browser UI — comparison (4/4 ok), synthesis with uncertainty, scores, preference saved + persisted, escalation recompute, history, exports, test-connection; all six views render; `npm run build` passes. Pixel screenshot pending (in-app browser panel must be visible); structure verified via accessibility snapshots + computed-style audit.
-
-## Production next steps
-
-1. Source pricing from the DO Model Catalog; per-tier model entitlements from the catalog API.
-2. Real auth (DO OAuth / API keys) + per-user rate limits and budget guards.
-3. Streaming token output per card; retries with backoff; circuit breakers.
-4. Swap SQLite for Postgres; add OpenTelemetry traces per experiment.
-5. Grow the preference dataset into pairwise evals; calibrate the judge against human labels; track judge–human agreement over time.
+1. Verification layer: retrieval/grounding for Deep mode and citation-checked synthesis (needs a search provider).
+2. Embedding-based semantic cache; calibrate similarity thresholds against human judgments.
+3. Learned router trained on the preference dataset; track judge–human agreement over time.
+4. Real auth (DO OAuth / API keys) + per-user rate limits and budget quotas; Postgres instead of SQLite; OpenTelemetry traces per experiment.
+5. Source pricing from the DO Model Catalog; per-tier model entitlements from the catalog API.
